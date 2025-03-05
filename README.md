@@ -1,6 +1,8 @@
 # auto_receipts_placing_on_a4paper
 Best for employees reimbursement use, easily pleacing scanned receipt images on A4 sized papers optimumly
 
+![Alt text](image1.png)
+
 ```html
 <!DOCTYPE html>
 <html lang="en">
