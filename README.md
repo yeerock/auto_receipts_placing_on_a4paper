@@ -13,6 +13,12 @@ https://vyrox.com/ai/receipts.html
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Receipt Organizer</title>
+    <!-- Add PDF.js library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // Set the PDF.js worker source
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -213,8 +219,8 @@ https://vyrox.com/ai/receipts.html
     <h1>Receipt Organizer</h1>
     
     <div class="upload-area" id="uploadArea">
-        <p>Click to upload receipt images or drag and drop them here</p>
-        <input type="file" id="fileInput" multiple accept="image/*" style="display:none">
+        <p>Click to upload PDF files or drag and drop them here (Images will be extracted automatically)</p>
+        <input type="file" id="fileInput" accept="application/pdf,image/*" style="display:none">
     </div>
     
     <div class="controls">
@@ -315,28 +321,383 @@ https://vyrox.com/ai/receipts.html
         savePdfBtn.addEventListener('click', savePdf);
         clearBtn.addEventListener('click', clearAll);
         
+        // PDF Extraction Functions
+    async function extractImagesFromPDF(pdfFile) {
+    const extractedImages = [];
+    
+    try {
+        updateLoaderText("Loading PDF file...");
+        // Load the PDF file
+        const arrayBuffer = await pdfFile.arrayBuffer();
+        updateLoaderText("Processing PDF content...");
+        const loadingTask = pdfjsLib.getDocument(arrayBuffer);
+        const pdf = await loadingTask.promise;
+        
+        updateLoaderText(`PDF loaded successfully. Found ${pdf.numPages} pages.`);
+        statusEl.textContent = `Extracting images from ${pdf.numPages} pages...`;
+        
+        // Get the document data
+        const data = await pdf.getData();
+        const resources = data.resources || {};
+        const xObjects = resources.XObject || {};
+        
+        // Process each page
+        for (let i = 1; i <= pdf.numPages; i++) {
+            updateLoaderText(`Analyzing page ${i} of ${pdf.numPages}...`);
+            const page = await pdf.getPage(i);
+            
+            // Get page resources
+            const pageResources = await page.getOperatorList();
+            const imageNames = new Set();
+            
+            // Find all image objects in the page
+            for (let j = 0; j < pageResources.fnArray.length; j++) {
+                if (pageResources.fnArray[j] === pdfjsLib.OPS.paintImageXObject) {
+                    const imageName = pageResources.argsArray[j][0];
+                    if (imageName) {
+                        imageNames.add(imageName);
+                    }
+                }
+            }
+            
+            console.log(`Page ${i}: Found ${imageNames.size} potential image references`);
+            
+            // Process each image reference
+            for (const imageName of imageNames) {
+                try {
+                    // Get the image data
+                    const img = await page.objs.get(imageName);
+                    
+                    if (img) {
+                        // Skip too small images (likely icons or decorations)
+                        const tooSmall = img.width < 10 || img.height < 10;
+                        
+                        if (!tooSmall && (img.data || img.bitmap)) {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = img.width;
+                            canvas.height = img.height;
+                            const ctx = canvas.getContext('2d');
+                            
+                            // Handle different types of image data
+                            if (img.data) {
+                                // Try to use the raw image data
+                                const imageData = ctx.createImageData(img.width, img.height);
+                                
+                                if (img.data instanceof Uint8ClampedArray) {
+                                    imageData.data.set(img.data);
+                                } else if (img.data instanceof Uint8Array) {
+                                    const clampedArray = new Uint8ClampedArray(img.data.buffer || img.data);
+                                    imageData.data.set(clampedArray);
+                                } else if (Array.isArray(img.data)) {
+                                    // Convert array to Uint8ClampedArray
+                                    const clampedArray = new Uint8ClampedArray(img.data);
+                                    imageData.data.set(clampedArray);
+                                }
+                                
+                                ctx.putImageData(imageData, 0, 0);
+                            } else if (img.bitmap) {
+                                // Use the bitmap if available
+                                ctx.drawImage(img.bitmap, 0, 0);
+                            }
+                            
+                            // Convert to data URL
+                            try {
+                                const dataURL = canvas.toDataURL('image/png');
+                                
+                                // Check if the image is not just a blank/transparent rectangle
+                                // by sampling a few pixels and checking if they're all the same
+                                const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                                let allSame = true;
+                                const firstPixel = [imgData[0], imgData[1], imgData[2], imgData[3]];
+                                
+                                // Sample every 100 pixels
+                                for (let p = 0; p < imgData.length; p += 400) {
+                                    if (imgData[p] !== firstPixel[0] || 
+                                        imgData[p+1] !== firstPixel[1] || 
+                                        imgData[p+2] !== firstPixel[2] || 
+                                        imgData[p+3] !== firstPixel[3]) {
+                                        allSame = false;
+                                        break;
+                                    }
+                                }
+                                
+                                // Skip if it's a blank/solid color image
+                                if (!allSame && dataURL && dataURL.length > 100) {
+                                    extractedImages.push({
+                                        src: dataURL,
+                                        width: img.width,
+                                        height: img.height,
+                                        page: i,
+                                        index: extractedImages.length
+                                    });
+                                    console.log(`Extracted image from page ${i}, name: ${imageName}, size: ${img.width}x${img.height}`);
+                                }
+                            } catch (e) {
+                                console.error(`Error converting to data URL for ${imageName}:`, e);
+                            }
+                        } else if (img.src) {
+                            // Use image source if available
+                            extractedImages.push({
+                                src: img.src,
+                                width: img.width || 100,
+                                height: img.height || 100,
+                                page: i,
+                                index: extractedImages.length
+                            });
+                            console.log(`Used direct image src from page ${i}, name: ${imageName}`);
+                        }
+                    }
+                } catch (imgError) {
+                    console.error(`Error processing image ${imageName} on page ${i}:`, imgError);
+                }
+            }
+            
+            // Try a second approach if needed
+            if (extractedImages.length === 0) {
+                try {
+                    // Extract image resources directly
+                    const resourceNames = Object.keys(page.resources?.XObject || {});
+                    
+                    for (const resourceName of resourceNames) {
+                        const resource = page.resources.XObject[resourceName];
+                        
+                        if (resource && resource.subtype === 'Image') {
+                            // Try to extract the image data
+                            const imageData = resource.data;
+                            
+                            if (imageData) {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = resource.width;
+                                canvas.height = resource.height;
+                                const ctx = canvas.getContext('2d');
+                                
+                                const imgData = ctx.createImageData(resource.width, resource.height);
+                                imgData.data.set(new Uint8ClampedArray(imageData.buffer || imageData));
+                                ctx.putImageData(imgData, 0, 0);
+                                
+                                const dataURL = canvas.toDataURL('image/png');
+                                
+                                extractedImages.push({
+                                    src: dataURL,
+                                    width: resource.width,
+                                    height: resource.height,
+                                    page: i,
+                                    index: extractedImages.length
+                                });
+                                console.log(`Extracted image resource from page ${i}, name: ${resourceName}`);
+                            }
+                        }
+                    }
+                } catch (resourceError) {
+                    console.error(`Error extracting resource images from page ${i}:`, resourceError);
+                }
+            }
+        }
+        
+        updateLoaderText(`Extraction complete. Found ${extractedImages.length} images.`);
+        console.log(`Total images extracted: ${extractedImages.length}`);
+        
+        // If no images were found after all attempts, render pages as images as a last resort
+        if (extractedImages.length === 0) {
+            updateLoaderText("No individual images found. Attempting one more extraction method...");
+            
+            // Try using a different approach to extract images
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+                
+                // Get content streams
+                const content = await page.getTextContent();
+                const operatorList = await page.getOperatorList();
+                
+                // Extract image data directly from operator list
+                for (let j = 0; j < operatorList.fnArray.length; j++) {
+                    if (operatorList.fnArray[j] === pdfjsLib.OPS.paintJpegXObject ||
+                        operatorList.fnArray[j] === pdfjsLib.OPS.paintImageXObject ||
+                        operatorList.fnArray[j] === pdfjsLib.OPS.paintImageMaskXObject) {
+                        
+                        const args = operatorList.argsArray[j];
+                        if (args && args.length > 0) {
+                            const imgName = args[0];
+                            const imgObj = await page.commonObjs.get(imgName) || await page.objs.get(imgName);
+                            
+                            if (imgObj && (imgObj.data || imgObj.bitmap)) {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = imgObj.width || 200;
+                                canvas.height = imgObj.height || 200;
+                                const ctx = canvas.getContext('2d');
+                                
+                                try {
+                                    if (imgObj.bitmap) {
+                                        ctx.drawImage(imgObj.bitmap, 0, 0);
+                                    } else if (imgObj.data) {
+                                        const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+                                        imgData.data.set(new Uint8ClampedArray(imgObj.data.buffer || imgObj.data));
+                                        ctx.putImageData(imgData, 0, 0);
+                                    }
+                                    
+                                    const dataURL = canvas.toDataURL('image/png');
+                                    extractedImages.push({
+                                        src: dataURL,
+                                        width: imgObj.width || 200,
+                                        height: imgObj.height || 200,
+                                        page: i,
+                                        index: extractedImages.length
+                                    });
+                                } catch (err) {
+                                    console.error(`Error processing alternative image extraction:`, err);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // As a last resort, render full pages
+        if (extractedImages.length === 0) {
+            updateLoaderText("Still no images found. Converting whole pages to images as fallback...");
+            
+            for (let i = 1; i <= Math.min(pdf.numPages, 20); i++) {
+                const page = await pdf.getPage(i);
+                const viewport = page.getViewport({ scale: 1.5 });
+                
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                const ctx = canvas.getContext('2d');
+                
+                await page.render({
+                    canvasContext: ctx,
+                    viewport: viewport
+                }).promise;
+                
+                const dataURL = canvas.toDataURL('image/png');
+                extractedImages.push({
+                    src: dataURL,
+                    width: viewport.width,
+                    height: viewport.height,
+                    page: i,
+                    index: extractedImages.length,
+                    isFullPage: true
+                });
+                
+                updateLoaderText(`Rendered page ${i} as image (fallback).`);
+            }
+        }
+        
+        return extractedImages;
+        
+    } catch (error) {
+        console.error('Error extracting images from PDF:', error);
+        updateLoaderText(`Error: ${error.message}`);
+        statusEl.textContent = `Failed to extract images: ${error.message}`;
+        
+        // Try fallback as a last resort
+        try {
+            updateLoaderText("Trying final fallback approach...");
+            const loadingTask = pdfjsLib.getDocument(await pdfFile.arrayBuffer());
+            const pdf = await loadingTask.promise;
+            
+            for (let i = 1; i <= Math.min(pdf.numPages, 20); i++) {
+                const page = await pdf.getPage(i);
+                const viewport = page.getViewport({ scale: 1.5 });
+                
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                const ctx = canvas.getContext('2d');
+                
+                await page.render({
+                    canvasContext: ctx,
+                    viewport: viewport
+                }).promise;
+                
+                const dataURL = canvas.toDataURL('image/png');
+                extractedImages.push({
+                    src: dataURL,
+                    width: viewport.width,
+                    height: viewport.height,
+                    page: i,
+                    index: extractedImages.length,
+                    isFullPage: true
+                });
+            }
+            
+            return extractedImages;
+        } catch (fallbackError) {
+            console.error('All extraction approaches failed:', fallbackError);
+            alert(`Unable to extract images from this PDF: ${fallbackError.message}`);
+            return [];
+        }
+    }
+}
+        
+        function isValidImageData(data) {
+            return data instanceof Uint8ClampedArray || 
+                   data instanceof Uint8Array || 
+                   data instanceof Array;
+        }
+        
         // Functions
-        function handleFiles(files) {
-            Array.from(files).forEach(file => {
-                if (file.type.startsWith('image/')) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        const img = new Image();
-                        img.onload = () => {
-                            const imageData = {
-                                src: e.target.result,
+        async function handleFiles(files) {
+            setProcessingState(true);
+            
+            try {
+                for (const file of Array.from(files)) {
+                    if (file.type === 'application/pdf') {
+                        updateLoaderText("Extracting images from PDF...");
+                        const extractedImages = await extractImagesFromPDF(file);
+                        updateLoaderText(`Found ${extractedImages.length} images in PDF...`);
+                        
+                        // Process each extracted image
+                        for (let i = 0; i < extractedImages.length; i++) {
+                            const imageData = extractedImages[i];
+                            updateLoaderText(`Processing image ${i+1} of ${extractedImages.length}...`);
+                            
+                            // Create an image to get dimensions
+                            const img = new Image();
+                            await new Promise((resolve, reject) => {
+                                img.onload = resolve;
+                                img.onerror = reject;
+                                img.src = imageData.src;
+                            });
+                            
+                            // Add to receiptImages array
+                            receiptImages.push({
+                                src: imageData.src,
                                 width: img.width,
                                 height: img.height,
                                 id: Date.now() + Math.random().toString(36).substr(2, 9)
+                            });
+                            
+                            // Display in preview
+                            displayPreview(receiptImages[receiptImages.length - 1]);
+                        }
+                    } else if (file.type.startsWith('image/')) {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            const img = new Image();
+                            img.onload = () => {
+                                const imageData = {
+                                    src: e.target.result,
+                                    width: img.width,
+                                    height: img.height,
+                                    id: Date.now() + Math.random().toString(36).substr(2, 9)
+                                };
+                                receiptImages.push(imageData);
+                                displayPreview(imageData);
                             };
-                            receiptImages.push(imageData);
-                            displayPreview(imageData);
+                            img.src = e.target.result;
                         };
-                        img.src = e.target.result;
-                    };
-                    reader.readAsDataURL(file);
+                        reader.readAsDataURL(file);
+                    }
                 }
-            });
+            } catch (error) {
+                console.error("Error processing files:", error);
+                alert("Error processing files: " + error.message);
+            } finally {
+                setProcessingState(false);
+            }
         }
         
         function displayPreview(imageData) {
@@ -373,6 +734,10 @@ https://vyrox.com/ai/receipts.html
         
         function updateLoaderText(text) {
             loaderText.textContent = text;
+        }
+        
+        function updatePDFStatus(message) {
+            statusEl.textContent = message;
         }
         
         function generateLayout() {
@@ -818,7 +1183,7 @@ https://vyrox.com/ai/receipts.html
             return true;
         }
 
-function markAreaOccupied(map, startX, startY, width, height) {
+        function markAreaOccupied(map, startX, startY, width, height) {
             // Mark the area as occupied
             for (let y = startY; y < startY + height; y++) {
                 for (let x = startX; x < startX + width; x++) {
